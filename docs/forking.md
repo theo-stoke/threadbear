@@ -25,7 +25,10 @@ Mike's copy (reporting to his Sentry, uploading his debug symbols).
 | Mike's deployments in docs | `docs/convex-backend.md`, `docs/website.md`, `docs/push-relay.md` | Names of Mike's Convex deployments, for his own use. The code never reads them; yours come from setup. |
 
 Code comments that say "Mike's releases" or tell a story from Mike's
-setup are kept on purpose, as the history of why a line is there.
+setup are kept on purpose, as the history of why a line is there. Text
+the app shows or sends to an agent says "the user" instead, except where
+it means Mike himself (his releases, the About credit);
+`runner/test/unit/fork-view.test.ts` checks that too.
 
 ## 2. Where each feature lives, and how to take it out
 
@@ -67,7 +70,14 @@ gone from your fork, not just quiet.
   another Mac over ssh, put `"checkHost": "<ssh host>"` in your
   runner.json, or `"checkHosts"` with a list of them (Mike's is
   `["tinker-desk", "cloud"]`; a Linux one only takes `--quick` runs that
-  don't touch `ios/`); without either, it runs on yours.
+  don't touch `ios/`); without either, it runs on yours. On your Mac it
+  keeps one ssh connection per host through a socket in `~/.ssh/tbc`, and
+  the lock on each checkout's copy in `~/.cache/threadbear-check-locks`,
+  both folders only you can use (mode 700, yours; one that's anything else
+  is never used: ssh then connects afresh each time, and the lock refuses
+  to run). The folder the host reports for its copies must be a plain
+  absolute path (letters, digits, `.`, `_`, `/`, `-`), or that host is
+  passed over.
 
 ### Optional, with a switch
 
@@ -92,7 +102,7 @@ gone from your fork, not just quiet.
 | Experiments | One file each, `runner/src/experiments/<id>.md`, read by `runner/src/experiments.ts`; [docs/experiments.md](experiments.md) lists where each lives and how to take it out | `experiments.<id>` in `runner.json`, off by default | Each one: what docs/experiments.md says, then delete its file and run `npm run experiment-docs` in `runner/`. `experiments.ts` stays. |
 | Codex | `runner/src/adapters/codex/`, `runner/src/updates/codex.ts` | No Codex login, and `cliUpdates: { codex: "off" }` | Woven in, but keep `'codex'` decodable as a provider. |
 | BrowserBear link hand-off | `app/Sources/Threadbear/BrowserBear.swift`, called from `PaneModel.swift` | Inert unless BrowserBear (Mike's own tool) is running | Self-contained: one file, one call. |
-| The Browser panel | `app/Sources/Threadbear/Views/AgentBrowserPanel.swift`, and `BrowserBearPipe.swift`, with cases in `PanelsView.swift`, `WindowDock.swift`, `PanelRequests.swift` and `Automation.swift` | Inert without BrowserBear; existing profiles use its private socket, separate agent Chrome retains its CDP path | Self-contained. |
+| The Browser panel | `app/Sources/Threadbear/Views/AgentBrowserPanel.swift`, and `BrowserBearPipe.swift`, with cases in `PanelsView.swift`, `WindowDock.swift`, and `PanelRequests.swift` | Inert without BrowserBear; lists pages, stills and Show window over its private socket | Self-contained. |
 
 ### Core, no switch
 

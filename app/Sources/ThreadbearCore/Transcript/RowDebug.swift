@@ -172,6 +172,7 @@ extension TranscriptModel {
         case .toolResult(let result): return ["t:" + result.itemId] + (result.images.isEmpty ? [] : ["i:" + result.itemId])
         case .editDiff(let diff): return ["t:" + diff.itemId]
         case .approvalRequested(let request): return ["ap:" + request.approvalId]
+        case .approvalQueued(let queue): return ["ap:" + queue.approvalId]
         case .questionRequested(let request): return ["q:" + request.approvalId]
         case .secretRequested(let request): return ["s:" + request.approvalId]
         case .reviewUpdated(let review): return ["review:" + review.id]
@@ -202,7 +203,7 @@ public enum TokenText {
     /// no counts.
     public static func line(_ usage: JSONValue?) -> String? {
         guard let usage else { return nil }
-        func count(_ key: String) -> Int? { usage[key]?.doubleValue.map { Int($0) } }
+        func count(_ key: String) -> Int? { usage[key]?.doubleValue.flatMap { $0.wholeCount() } }
         var parts: [String] = []
         if let input = count("inputTokens") {
             var part = format(input) + " in"

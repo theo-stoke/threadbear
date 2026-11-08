@@ -51,6 +51,7 @@ extension AppModel {
                 guard !Task.isCancelled, self.client === client else { return }
                 self.updateRestart { $0.status(status.pendingRestart, now: Date()) }
                 if self.websiteURL != status.websiteURL { self.websiteURL = status.websiteURL }
+                if self.pushOff != status.pushOff { self.pushOff = status.pushOff }
             } catch RPCError.server(let code, _) where code == -32601 {
                 // A runner older than runner.status: its notices are all there is.
             } catch {
@@ -67,6 +68,9 @@ extension AppModel {
         let restarting = restart.isRestarting(now: max(now, Date()))
         switch connection {
         case .connected:
+            // Mike's own click comes first: he's looking for it.
+            if let note = busyNotes.last { return Banner(style: .quiet, icon: nil, text: note.text) }
+            if let doneNote { return Banner(style: .quiet, icon: "checkmark", text: doneNote) }
             if restarting {
                 return Banner(style: .quiet, icon: nil, text: "The runner is restarting now.")
             }
@@ -195,7 +199,7 @@ extension AppModel {
     func runAction(_ action: Action, in threadId: String) {
         if action.kind == .url {
             if let page = action.webPage {
-                NSWorkspace.shared.open(page)
+                OpenGate.openWeb(page)
             } else {
                 errorMessage = "\(action.title) has no web page to open."
             }

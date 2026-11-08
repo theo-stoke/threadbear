@@ -31,19 +31,16 @@ struct RunnersSettings: View {
 
             SettingsSection("Runners",
                             about: canOrder
-                                ? "The machines your threads can run on, in your order. New threads from your phone start on the first one that's online. Drag a runner by its handle to change the order. Each runner is set up on its own machine."
+                                ? "The machines your threads can run on, in your order. New threads from your phone start on the first one that's online. Drag a runner to change the order. Each runner is set up on its own machine."
                                 : "The machines your threads can run on. Each runner is set up on its own machine.",
                             ask: "add one, rename one, pair it with this Mac or change how it runs. It knows how, and a Linux server's steps are in INSTALL.md.") {
                 if canOrder {
-                    let ids = app.orderedRunnerIds
-                    ForEach(ids, id: \.self) { id in
+                    ReorderList(ids: app.orderedRunnerIds, style: .formRows, preview: app.runnerDragPreview, commit: { app.setRunnerOrder($0) }) { id in
                         row(for: id, movable: true)
-                            .draggable(id)
-                            .dropDestination(for: String.self) { dropped, _ in
-                                guard let from = dropped.first, from != id, ids.contains(from) else { return false }
-                                app.moveRunner(from, to: id)
-                                return true
-                            }
+                            .accessibilityAction(named: "Move up") { app.moveRunner(id, by: -1) }
+                            .accessibilityAction(named: "Move down") { app.moveRunner(id, by: 1) }
+                            // A Form row's height on the Mac, to match the sections around.
+                            .frame(minHeight: 38)
                     }
                 } else {
                     RunnerRow(icon: app.selfRunnerIcon, name: selfName, status: "This Mac", isDefault: app.defaultRunnerId == nil)
@@ -74,7 +71,7 @@ struct RunnersSettings: View {
     /// The order is in once this Mac's runner and its backend have it (API 58).
     /// Not before this Mac's own id is known (runners.list): a move then
     /// would save an order without it and push it down the phone's list.
-    private var canOrder: Bool { app.runnerOrder != nil && !app.remoteRunners.isEmpty && app.runners.contains(where: \.isSelf) }
+    private var canOrder: Bool { app.canOrderRunners }
 
     @ViewBuilder private func row(for id: String, movable: Bool) -> some View {
         if let runner = app.remoteRunners.first(where: { $0.id == id }) {
@@ -94,8 +91,7 @@ struct RunnersSettings: View {
 }
 
 /// A runner: its icon, name and how it is, with a star on the default, and
-/// in the ordered list a drag handle on the left, as on the phone (Mike,
-/// 7 Nov: arrows on the right didn't say "drag me").
+/// in the ordered list a drag handle on the left, as on the phone.
 private struct RunnerRow: View {
     let icon: String
     let name: String
@@ -109,7 +105,7 @@ private struct RunnerRow: View {
                 Image(systemName: "line.3.horizontal")
                     .foregroundStyle(.tertiary)
                     .tip("Drag to change the order")
-                    .accessibilityLabel("Drag to change the order")
+                    .accessibilityHidden(true)
             }
             Image(systemName: icon)
                 .foregroundStyle(.secondary)

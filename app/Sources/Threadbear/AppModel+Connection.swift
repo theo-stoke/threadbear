@@ -67,6 +67,7 @@ extension AppModel {
                 threads = fresh
                 threadsLoaded = true
                 onThreadsLoaded?()
+                threadCountMayHaveChanged()
                 servePanelRequest()
                 loadSchedules()
                 loadRunners()
@@ -74,6 +75,7 @@ extension AppModel {
                 loadProjects()
                 loadConnectors()
                 loadSettings()
+                loadStandingInstructions()
                 // Other runners' threads come back with their own connection.
                 for session in sessions.values where session.state == .loaded && !viaDirectLink(session.threadId) {
                     await session.subscribe()
@@ -162,6 +164,8 @@ extension AppModel {
                 connectors = status
             case .settingsUpdated(let settings):
                 receive(settings)
+            case .standingInstructions(let instructions):
+                standingInstructions = instructions
             case .runnerNotice(let level, let message):
                 notice(level: level, message)
             case .runnerUpdates(let updates):
@@ -218,7 +222,7 @@ extension AppModel {
     }
 
     func startRunner() {
-        Task {
+        whileBusy(BusyKey.startRunner) { [self] in
             let result = await RunnerLauncher.start()
             if let failure = result { errorMessage = failure }
             try? await Task.sleep(for: .milliseconds(600))
@@ -249,6 +253,7 @@ extension AppModel {
     private func apply(_ thread: ThreadSummary) {
         let previous = threads[thread.id]
         threads[thread.id] = thread
+        threadCountMayHaveChanged()
         // The open transcript's "3 sub-agents working in the background"
         // line follows the summary, not the events.
         if previous?.background != thread.background { sessions[thread.id]?.setBackground(thread.background) }

@@ -488,7 +488,10 @@ function takes `token` (a phone token from `tokens:issue`) and throws
 
 Queries:
 
-- `phone:me({ token })` → `{ name, expiresAt }`.
+- `phone:me({ token })` → `{ name, expiresAt, apiVersion, pushOff? }`.
+  `pushOff` is true when this backend can't send notifications (a
+  self-hosted one, docs/self-hosting.md); the phone's Settings says so in
+  place of the Notify me picker.
 - `phone:runners({ token })` → `[{ runnerId, name, version, lastSeenAt,
   draining }]`. Offline is `lastSeenAt` older than 3 minutes (a runner
   that stopped for good has `lastSeenAt` of 1970).
@@ -504,8 +507,11 @@ Queries:
   picked for Mike once he's placed it.
 - `phone:wakes({ token })` (API 45) → `[{ scheduleId, threadId?, nextRunAt? }]`,
   a small row per active schedule, from `scheduleWakes`: what a sidebar needs
-  all the time. `phone:schedules` costs about 150 KB and re-runs on every claim
-  and run, so it's for a schedules view that's open.
+  all the time: the website's sidebar, and the iPhone's inbox (from the app
+  after 1.0.4; older ones, and any on a backend before 45, follow
+  `phone:schedules`). `phone:schedules` costs about 200 KB and re-runs on every
+  claim and run, so it's for a schedules view that's open. Kept open by the
+  phone's inbox it was about 10 MB of Database I/O a day (7 Nov).
 - `phone:runnerStats({ token })` (API 45) → each runner's machine figures, last
   reported while someone was watching, and `phone:watchRunners({ token })` says
   someone is (docs/protocol.md, Sync, "Runner figures").
@@ -522,7 +528,7 @@ Queries:
   follow-ups, for the done card. `needs` (`you` | `nothing`),
   `pendingReviews` and `waitingForRoom` (`{ until, accountId? }`) (API 15)
   are what the phone needs to sort threads into the Mac sidebar's
-  sections: with `phone:schedules` it puts an idle thread a schedule will
+  sections: with `phone:wakes` it puts an idle thread a schedule will
   message under Hibernating, by the same rules as app ThreadSections. `pendingApproval`
   (from step 2) is `{ approvalId, kind: "approval", name, title, options:
   ("allow" | "allowAlways" | "deny")[], inputSummary? }` or `{ approvalId,
@@ -540,7 +546,9 @@ Queries:
   oldest message the phone has is newer than that, there's more to load.
 - `phone:messages({ token, threadId, beforeSeq?, limit?, tools? })` (since
   API 2, 28 Oct) → `{ messages, hasMore }`, oldest first: the newest `limit`
-  (default 50, at most 2000) or the `limit` before `beforeSeq`. Every message
+  (default 50, at most 2000; NaN or an infinity is refused, here and in every
+  `limit`) or the `limit` before `beforeSeq`. Without `tools` it looks past at
+  most 4,000 tool rows for the page's text ones, then says `hasMore`. Every message
   is kept since API 2, and with `tools: true` there's one row per tool call
   too (`role: "tool"`, a one-line `text` such as "Run the unit tests" or
   "Edited ~/dev/x.ts", and `toolKind`). It reads Convex alone, so it works
@@ -561,7 +569,8 @@ Queries:
 - `phone:images({ token, threadId, from })` (API 37) → the thread's pictures
   from that seq on, for a client passing `noImages: true` to `phone:messages`.
 - `phone:command({ token, commandId })` → `{ state: "pending" | "taken" |
-  "done" | "failed", note?, threadId? }`.
+  "done" | "failed", note?, threadId?, result? }`. `result` (API 62) is a
+  `slashCommands` command's answer, the thread's list.
 - `phone:waiting({ token, threadId })` (API 57) → the thread's `send`
   commands not yet finished, oldest first: `{ commandId, state: "pending" |
   "taken", text, photos, createdAt }`. The phone shows each as a faded
@@ -592,7 +601,11 @@ sidebar does; a runner before API 5 sends projects without `icon`.
 Mutations, each returning a `commandId`. The owning runner takes it
 within a second or two while it's online (state `taken`, then `done` or
 `failed` with a `note`); while it's offline the command waits as
-`pending`:
+`pending`, for up to 14 days (then `failed`, `sync:pruneFiles`). At most
+200 commands, or 8 MB of them, wait for one runner; past that the next is
+refused with `{ kind: "tooMany" }` until it takes some. A `runnerId` the
+phone names must be one that has heartbeated (or `"any"`), else
+`{ kind: "notFound" }`:
 
 - `phone:send({ token, threadId, text, answers? })` (`answers`, API 14: the card's asks it answers, `{ action, answer }[]`)
 - `phone:press({ token, threadId, buttonId })` (API 59) → commandId: a
@@ -600,6 +613,12 @@ within a second or two while it's online (state `taken`, then `done` or
   `press` command with `{ buttonId }`. Its `resultThreadId` is the thread
   the button started or messaged. `phone:messages` rows carry `buttons`,
   the state of the buttons an assistant message links, since API 59.
+- `phone:slashCommands({ token, threadId })` (API 62) → commandId: asks
+  the thread's runner for the slash commands it can run, for the reply
+  box's palette (docs/protocol.md, "Slash commands"). The runner answers
+  with its `threads.commands` list as the command's `result` (kept by
+  `sync:finishCommand` as for a `call`); an older runner fails it as
+  unknown.
 - `phone:respond({ token, threadId, approvalId, decision: "allow" |
   "allowAlways" | "deny", message? })`
 - `phone:answer({ token, threadId, approvalId, answers: Record<string,
@@ -641,7 +660,11 @@ within a second or two while it's online (state `taken`, then `done` or
   after a day, so the phone should ask again rather than expect them to
   stay.
 - `phone:registerDevice({ token, apnsToken, environment: "sandbox" |
-  "production" })`. A push arrives when a thread starts needing Mike,
+  "production" })`. `apnsToken` is the device token in hex. A phone token
+  keeps at most 5 registrations; a new one past that replaces its oldest.
+  Revoking a token takes effect in that one small write (its phones get no
+  more pushes at once, `devices:targets`); their rows are deleted after, 100
+  a run (`tokens:dropDevices`). A push arrives when a thread starts needing Mike,
   as `{ aps: { alert: { title, body }, sound: "default", "thread-id":
   threadId }, threadId }` for bundle id `com.mikecann.threadbear`; the
   title is the thread's title and the body the question, the approval

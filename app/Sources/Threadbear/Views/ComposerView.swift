@@ -24,13 +24,13 @@ struct ComposerView: View {
     @State private var importing = 0
     @State private var handle = ComposerHandle()
     @State private var palette = PaletteState()
-    /// The pane's width (paletteWindow), from the frame round the box.
-    @State private var paneWidth: CGFloat = 0
 
     static var cornerRadius: CGFloat { zoomed(20) }
     static var padding: CGFloat { zoomed(14) }
 
     private var draftKey: String { thread?.id ?? "new" }
+    /// Messages sent from this box, for the send arrow's nudge.
+    @State private var sends = 0
 
     var body: some View {
         // Normalized, so a picture added from outside the box (an ask's
@@ -43,7 +43,7 @@ struct ComposerView: View {
         let picks = thread.map { app.picks(for: $0) } ?? [:]
         // So are follow-ups ticked on a done card.
         let followUps = thread.map { app.pickedFollowUps(threadId: $0.id) } ?? FollowUpPicks()
-        let canSend = !picks.isEmpty || !followUps.isEmpty || ComposerChips.canSend(text: draft.wrappedValue.text, imageCount: draft.wrappedValue.images.count)
+        let canSend = Self.canSend(draft.wrappedValue, picks: picks, followUps: followUps)
         // A new thread on its way: what was sent stays, greyed and locked,
         // until the runner has made the thread.
         let creating = thread == nil && app.creatingThread
@@ -69,7 +69,7 @@ struct ComposerView: View {
         // The box: the open card over a line, then the message.
         VStack(alignment: .leading, spacing: 0) {
         if let cardRow, let controller {
-            ComposerCard(row: cardRow, collapsed: cardCollapsed, controller: controller)
+            ComposerCard(row: cardRow, threadId: thread?.id, collapsed: cardCollapsed, controller: controller)
                 .padding(.horizontal, Self.padding)
                 .padding(.top, zoomed(8))
                 .padding(.bottom, zoomed(10))
@@ -114,6 +114,7 @@ struct ComposerView: View {
                 onSend: { send() },
                 onSchedule: { app.newSchedule(from: thread, draftKey: draftKey) }
             )
+            .environment(\.sendNudges, sends)
         }
         .padding(Self.padding)
         }
@@ -129,35 +130,18 @@ struct ComposerView: View {
         // panel was picked up (Codex's review, 6 Nov).
         .onAppear { if !isGhost { controller?.composerHandle = handle } }
         }
-        // The slash command palette, over the transcript just above the box.
+        // The slash command palette, in a panel of its own just above the
+        // box (SlashPalettePanel): drawn here it was cut off at the pane.
         .overlay(alignment: .top) {
-            if let thread, let query = paletteQuery(draft.wrappedValue.text) {
-                let height = paletteHeight
-                SlashPaletteView(
-                    commands: app.slashCommands[thread.id],
-                    query: query,
-                    provider: thread.provider,
-                    recent: app.recentSlashCommands,
-                    state: $palette,
-                    current: paletteCurrent(thread),
-                    onFill: { pick($0, run: false) },
-                    onRun: { pick($0, run: true) },
-                    // Another Mac's runner found the file there, not here.
-                    onOpen: app.runnerName(of: thread) == nil ? { path in
-                        palette.closedAt = draft.wrappedValue.text
-                        app.preview(path: path, in: thread)
-                    } : nil,
-                    height: height,
-                    layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 }),
-                    window: paletteWindow
-                )
-                // A width Mike dragged it to, centred over the box; else the
-                // box's own.
-                .frame(width: app.slashPaletteLayout.width.map { CGFloat(SlashPalette.Layout.width($0, window: paletteWindow.width)) })
-                // Its height is fixed, so lifting it by that sits it just above.
-                .offset(y: -(height + zoomed(8)))
-                .onAppear { app.loadSlashCommands(thread.id) }
-            }
+            SlashPaletteHost(
+                content: paletteContent(draft),
+                autoHeight: paletteHeight,
+                layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 })
+            )
+            .frame(height: 1)
+        }
+        .task(id: thread.flatMap { paletteQuery(draft.wrappedValue.text) != nil ? $0.id : nil }) {
+            if let thread, paletteQuery(draft.wrappedValue.text) != nil { app.loadSlashCommands(thread.id) }
         }
         // Esc closed the palette at that text only: any change reopens it,
         // even back to the same words later.
@@ -168,10 +152,6 @@ struct ComposerView: View {
         // centred, with the same side insets once the window is narrower.
         .frame(maxWidth: Theme.maxContentWidth)
         .padding(.horizontal, Theme.sideInset)
-        // As wide as the pane, the box still centred in it, so its width
-        // can be read for the palette.
-        .frame(maxWidth: .infinity)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { paneWidth = $0 }
         // At 12 the card looked wedged against the window's rounded bottom
         // corners; Codex and T3 leave about 24.
         .padding(.bottom, zoomed(20))
@@ -191,6 +171,10 @@ struct ComposerView: View {
             .fill(dark ? Color.primary.opacity(0.085) : Color.white)
             .shadow(color: .black.opacity(dark ? 0 : 0.08), radius: zoomed(14), y: zoomed(4))
             .overlay(shape.strokeBorder(attention ? Color(nsColor: .controlAccentColor) : Color(nsColor: .separatorColor), lineWidth: attention ? 1 : 0.5))
+            // Fades up with a card settling in, rather than snapping on. Not
+            // going to a thread that's waiting already: this box is reused
+            // from thread to thread, and those change over at once.
+            .animation(session?.arrivingCard != nil ? .easeOut(duration: 0.2) : nil, value: attention)
             .contentShape(shape)
             .onTapGesture { app.focusComposer(draftKey) }
     }
@@ -212,14 +196,29 @@ struct ComposerView: View {
         return SlashPalette.height(window: window, least: zoomed(300), most: zoomed(560))
     }
 
-    /// The window's height, and the width of the pane the box is in: a
-    /// palette dragged wider than the pane is cut off at its edges, so the
-    /// pane's width (less a margin) is the most it can be.
     private var paletteWindow: CGSize {
-        let size = handle.textView?.window?.contentLayoutRect.size ?? NSApp.keyWindow?.contentLayoutRect.size ?? CGSize(width: 1200, height: 800)
-        // Layout.width keeps 40 clear each side of what it's given.
-        let pane = paneWidth > 0 ? paneWidth : size.width
-        return CGSize(width: pane + 80 - zoomed(16), height: size.height)
+        handle.textView?.window?.contentLayoutRect.size ?? NSApp.keyWindow?.contentLayoutRect.size ?? CGSize(width: 1200, height: 800)
+    }
+
+    /// The palette for what's typed, or nil when it's closed.
+    private func paletteContent(_ draft: Binding<Draft>) -> SlashPaletteView? {
+        guard let thread, let query = paletteQuery(draft.wrappedValue.text) else { return nil }
+        return SlashPaletteView(
+            commands: app.slashCommands[thread.id],
+            query: query,
+            provider: thread.provider,
+            recent: app.recentSlashCommands,
+            state: $palette,
+            current: paletteCurrent(thread),
+            onFill: { pick($0, run: false) },
+            onRun: { pick($0, run: true) },
+            // Another Mac's runner found the file there, not here.
+            onOpen: app.runnerName(of: thread) == nil ? { path in
+                palette.closedAt = draft.wrappedValue.text
+                app.preview(path: path, in: thread)
+            } : nil,
+            layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 })
+        )
     }
 
     /// What /model and /effort would change, as the thread has it now.
@@ -282,7 +281,17 @@ struct ComposerView: View {
     /// AppModel empties the box, and puts the draft back if it isn't sent.
     /// Picked answers go with it.
     private func send() {
+        // Return in an empty box comes here too, with nothing to go.
+        if Self.canSend((app.drafts[draftKey] ?? Draft()).normalized,
+                        picks: thread.map { app.picks(for: $0) } ?? [:],
+                        followUps: thread.map { app.pickedFollowUps(threadId: $0.id) } ?? FollowUpPicks()) {
+            sends &+= 1
+        }
         app.send(threadId: thread?.id)
+    }
+
+    private static func canSend(_ draft: Draft, picks: [Int: Int], followUps: FollowUpPicks) -> Bool {
+        !picks.isEmpty || !followUps.isEmpty || ComposerChips.canSend(text: draft.text, imageCount: draft.images.count)
     }
 
     /// Return with nothing typed sends picked answers on their own (once
@@ -321,12 +330,11 @@ struct ComposerView: View {
         return true
     }
 
-    /// Whether pictures can go in this box, saying why not when they can't:
-    /// a picture this Mac's runner keeps would be a path another runner
-    /// hasn't got.
+    /// Whether pictures can go in this box, saying why not when they can't
+    /// (only over the direct link to another runner: `picturesRefusal`).
     private func picturesAllowed() -> Bool {
-        if let name = thread.flatMap(app.runnerName(of:)) ?? (thread == nil ? app.newThreadRunner?.name : nil) {
-            app.errorMessage = "Pictures can't go to \(name) from this Mac yet."
+        if let why = app.picturesRefusal(for: thread) {
+            app.errorMessage = why
             return false
         }
         return true
@@ -984,9 +992,21 @@ final class ComposerTextView: NSTextView {
         nextResponder?.tryToPerform(#selector(NSResponder.cancelOperation(_:)), with: sender)
     }
 
+    /// Where Paste reads from: the clipboard, or a test's own board.
+    var pasteSource: NSPasteboard = .general
+
     override func paste(_ sender: Any?) {
-        if takeImages(from: .general) { return }
+        if takeImages(from: pasteSource) { return }
         super.paste(sender)
+    }
+
+    /// A plain text view only offers Paste when the clipboard has words (or
+    /// another type it reads), so a screenshot copied with ⌘⌃⇧4, which is
+    /// only HEIC and TIFF, left Paste greyed out and ⌘V did nothing
+    /// (Behrooz, 7 Nov). Pictures and files paste too.
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(paste(_:)), isEditable, hasFiles(pasteSource) { return true }
+        return super.validateUserInterfaceItem(item)
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -1058,13 +1078,26 @@ final class ComposerTextView: NSTextView {
         (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType?.conforms(to: .image)) == true
     }
 
+    /// Image types a clipboard carries as they are, best first. Only the
+    /// types it declares count: asking for one it doesn't have (PNG from a
+    /// screenshot's HEIC and TIFF) makes macOS convert it, about 84 MB of
+    /// TIFF for one screen, and this runs every time a menu opens.
+    static let imageTypes: [NSPasteboard.PasteboardType] = [.png, NSPasteboard.PasteboardType("public.heic"), NSPasteboard.PasteboardType("public.jpeg"), .tiff]
+
+    static func imageType(_ pasteboard: NSPasteboard) -> NSPasteboard.PasteboardType? {
+        let types = Set(pasteboard.types ?? [])
+        return imageTypes.first(where: types.contains)
+    }
+
+    /// Cheap: types only, no data read.
     private func hasFiles(_ pasteboard: NSPasteboard) -> Bool {
-        !fileURLs(pasteboard).isEmpty || pasteboard.data(forType: .png) != nil || pasteboard.data(forType: .tiff) != nil
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return pasteboard.canReadObject(forClasses: [NSURL.self], options: options) || Self.imageType(pasteboard) != nil
     }
 
     /// Files pasted or dropped. Pictures go to `media.import` as chips;
-    /// raw image data (a screenshot on the clipboard) is written to a temp
-    /// PNG first. Any other file (a video, a PDF, a folder) goes in as its
+    /// raw image data (a screenshot on the clipboard) is written to a file
+    /// first. Any other file (a video, a PDF, a folder) goes in as its
     /// full path, for the agent to open where it is: nothing's copied, so
     /// a big one costs nothing, except one macOS is about to take back (a
     /// floating thumbnail's), where an APFS clone keeps it for free.
@@ -1095,19 +1128,23 @@ final class ComposerTextView: NSTextView {
         }
         // Text with an image flavour (rich text from a browser) stays text.
         if pasteboard.string(forType: .string) != nil { return false }
-        guard let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) else { return false }
-        let png: Data?
-        if pasteboard.data(forType: .png) != nil {
-            png = data
-        } else {
-            png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:])
+        // PNG, HEIC (a screenshot copied with ⌘⌃⇧4) and JPEG go in as they
+        // are, as the runner takes them; TIFF goes in as PNG.
+        guard let type = Self.imageType(pasteboard), let data = pasteboard.data(forType: type) else { return false }
+        let saved: Data?
+        let ext: String
+        switch type {
+        case .png: (saved, ext) = (data, "png")
+        case NSPasteboard.PasteboardType("public.heic"): (saved, ext) = (data, "heic")
+        case NSPasteboard.PasteboardType("public.jpeg"): (saved, ext) = (data, "jpeg")
+        default: (saved, ext) = (NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]), "png")
         }
-        guard let png else { return false }
+        guard let saved else { return false }
         let folder = DroppedFiles.keepFolder
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let url = folder.appendingPathComponent("pasted-\(UUID().uuidString.prefix(8)).png")
+        let url = folder.appendingPathComponent("pasted-\(UUID().uuidString.prefix(8)).\(ext)")
         do {
-            try png.write(to: url)
+            try saved.write(to: url)
             deliver([url], at: range)
             return true
         } catch {

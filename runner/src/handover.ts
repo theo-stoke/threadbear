@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { paths } from './config.ts';
+import { RUNNER_VERSION, paths } from './config.ts';
 import { atomicWriteFileSync, readJsonSync } from './fsutil.ts';
 import type { Logger } from './log.ts';
 import { RunnerClient, RpcClientError } from './client.ts';
@@ -24,7 +24,8 @@ import { ErrorCode, RpcError } from './protocol.ts';
 import type { PermissionMode, ThreadSummary } from './protocol.ts';
 import type { Notification, Runner } from './runner.ts';
 import type { UsageReading } from './usage.ts';
-import type { AgentApprovalRequest, ProjectControl, ScheduleControl, ThreadControl } from './threadbear-mcp.ts';
+import type { AgentApprovalRequest, ProjectControl, RemoteControl, ScheduleControl, ThreadControl } from './threadbear-mcp.ts';
+import type { RemoteThreads } from './thread-index.ts';
 import type { ToolApprovalAnswer } from './adapters/types.ts';
 import type { Scheduler } from './schedules.ts';
 import type { CommandHost } from './sync.ts';
@@ -464,7 +465,13 @@ export class PrimaryLink {
 
   private connect(): Promise<RunnerClient> {
     if (!this.client) {
-      const c = RunnerClient.connect(this.url, this.token);
+      // It says hello so the primary's log can name it (THREADBEAR-F: the
+      // primary closed one as "not reading" and couldn't say whose it was).
+      // Not waited for: frames arrive in order, so it's there before any call.
+      const c = RunnerClient.connect(this.url, this.token).then((cl) => {
+        void cl.call('hello', { client: 'threadbear-drain', version: RUNNER_VERSION, pid: process.pid }).catch(() => {});
+        return cl;
+      });
       this.client = c;
       c.then(
         (cl) => void cl.waitClosed().then(() => {
@@ -525,10 +532,32 @@ export function peersElsewhere(peers: Peers): Elsewhere {
 export function primaryElsewhere(link: PrimaryLink, runner: Pick<Runner, 'has'>): Elsewhere {
   return {
     owns: (id) => !runner.has(id),
-    find: async (id) => (await link.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS })).threads.find((t) => t.id === id),
+    // Just this thread (THREADBEAR-F): list_schedules looks up every
+    // schedule's thread at once, and all 900 summaries for each lookup piled
+    // up past the primary's limit, which closed this link. An older primary
+    // ignores ids and sends them all, so the one is still picked out here.
+    find: async (id) => (await link.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS, ids: [id] })).threads.find((t) => t.id === id),
     list: async (include) => (await link.call<{ threads: ThreadSummary[] }>('threads.list', { include })).threads,
     search: async (query, limit) => (await link.call<{ threads: ThreadSummary[] }>('threads.search', { query, limit })).threads,
     call: (method, params) => link.call(method, params),
+  };
+}
+
+// Other runners' threads for a draining runner's agent tools, through the
+// primary: a draining runner has stopped its own sync, but its kept turns
+// still have to reach them. On 8 Nov a thread started from the cloud runner
+// finished its turn on a draining M5 runner and couldn't send_message the
+// cloud thread its brief said to report to. The primary lists them as its
+// own tools have them (remoteThreads.list with forTools, which waits there
+// for the backend's rows), and passes a call for one of them on through its
+// relay (rpc.ts, THREAD_METHODS).
+export function primaryRemote(link: Pick<PrimaryLink, 'call'>): RemoteControl {
+  return {
+    list: async () => {
+      const r = await link.call<RemoteThreads>('remoteThreads.list', { forTools: true });
+      return { runners: r?.runners ?? [], threads: r?.threads ?? [], ...(r?.order ? { order: r.order } : {}) };
+    },
+    call: (threadId, method, params) => link.call(method, { threadId, ...params }),
   };
 }
 
@@ -569,6 +598,10 @@ export class ThreadRouter implements ThreadControl {
   // Always this runner's: it's asked by the session it runs itself.
   endTurnNudged(threadId: string): boolean {
     return this.runner.endTurnNudged(threadId);
+  }
+
+  openSubagentCards(threadId: string): string[] {
+    return this.runner.openSubagentCards(threadId);
   }
 
   async list(include: Bucket[] = ['inbox']): Promise<ThreadSummary[]> {
@@ -630,6 +663,15 @@ export class ThreadRouter implements ThreadControl {
     return this.away(threadId) ? 'full' : this.runner.accessOf(threadId);
   }
 
+  // Likewise outside any sandbox, which is the most it could have.
+  async confinedOf(threadId: string): Promise<boolean> {
+    return this.away(threadId) ? false : this.runner.confinedOf(threadId);
+  }
+
+  sandboxed(cwd: string): boolean {
+    return this.runner.sandboxed(cwd);
+  }
+
   // Likewise for a threadbear tool's own card (threadbear-mcp.ts, "Raising access").
   requestAgentApproval(threadId: string, req: AgentApprovalRequest): Promise<ToolApprovalAnswer> {
     return this.runner.requestAgentApproval(threadId, req);
@@ -653,12 +695,14 @@ export class ThreadRouter implements ThreadControl {
 
   async update(upd: Parameters<Runner['update']>[0]): Promise<ReturnType<Runner['update']>> {
     const e = this.away(upd.threadId);
-    return e ? e.call('threads.update', { ...upd }) : this.runner.update(upd);
+    // Said either way, as the primary takes a move with neither as Mike's.
+    return e ? e.call('threads.update', { ...upd, unconfine: upd.unconfine === true }) : this.runner.update(upd);
   }
 
   async interrupt(threadId: string): Promise<Record<string, never>> {
     const e = this.away(threadId);
-    return e ? e.call('threads.interrupt', { threadId }) : this.runner.interrupt(threadId);
+    // The router is what agents' tools go through, so this isn't Mike's Stop.
+    return e ? e.call('threads.interrupt', { threadId, byAgent: true }) : this.runner.interrupt(threadId);
   }
 
   async delete(threadId: string): Promise<Record<string, never>> {
@@ -687,13 +731,15 @@ export function phoneCommands(runner: Runner, remote?: Pick<Peers, 'owns' | 'cal
     // it over the local link, both runners sharing the one data dir.
     answerSecret: (p) => at(p.threadId, 'secrets.answer', { ...p }, () => runner.answerSecret(p)),
     update: (p) => at(p.threadId, 'threads.update', { ...p }, () => runner.update(p)),
+    hibernateWhen: (p) => at(p.threadId, 'threads.hibernateWhen', { ...p }, () => runner.hibernateWhen(p)),
     // Up to whatever it has: markSeen keeps it within the thread's events.
     markSeen: (id) => at(id, 'threads.markSeen', { seq: Number.MAX_SAFE_INTEGER }, () => runner.markSeen(id, runner.get(id).lastSeq)),
     create: (p) => runner.create(p),
     share: (id, p) => at(id, 'threads.share', { ...p }, () => runner.share(id, p)),
-    interrupt: (id) => at(id, 'threads.interrupt', {}, () => runner.interrupt(id)),
+    interrupt: (id) => at(id, 'threads.interrupt', {}, () => runner.interrupt(id, { byMike: true })),
     quickAsk: (p) => runner.quickAsk(p),
     pressButton: (id, buttonId) => at(id, 'buttons.press', { buttonId }, () => runner.pressButton(id, buttonId)),
+    threadCommands: (id) => at(id, 'threads.commands', {}, () => runner.threadCommands(id)),
   };
 }
 

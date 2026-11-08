@@ -9,6 +9,7 @@ extension AppModel {
     // MARK: Thread actions
 
     func newThread() {
+        newThreadProjectId = nil
         selection = nil
         openProjectId = nil
         showsProjectsHome = false
@@ -17,6 +18,23 @@ extension AppModel {
         stopShowingSubagent()
         sidebarMode = .inbox
         focusComposer("new")
+    }
+
+    /// New Thread on a project's page: the new-thread box, in the project's
+    /// first folder (the default folder if it has none), the thread joining
+    /// the project as it's made. The folder can still be changed there.
+    func newThread(in project: Project) {
+        newThread()
+        guard selection == nil else { return }
+        // A project is this Mac's runner's: back to it the way the machine
+        // menu goes, so another Mac's login and folder don't come along. Even
+        // when it's on this Mac already: picked, so a default Mac coming
+        // online doesn't take the draft over.
+        chooseNewThreadRunner(nil)
+        newThreadProjectId = project.id
+        // Its first folder, or the default one: never a folder left from
+        // another draft.
+        newThreadCwd = project.folders.first
     }
 
     /// Collapses the thread's card of asks, or brings it back. The cursor
@@ -66,10 +84,8 @@ extension AppModel {
     /// imported as the composer's are and added to that ask's answer.
     func addNoteImages(thread: ThreadSummary, ask: Int, urls: [URL]) {
         guard !urls.isEmpty else { return }
-        // A picture this Mac's runner keeps would be a path another
-        // runner hasn't got (as in the composer).
-        if let name = runnerName(of: thread) {
-            errorMessage = "Pictures can't go to \(name) from this Mac yet."
+        if let why = picturesRefusal(for: thread) {
+            errorMessage = why
             return
         }
         let threadId = thread.id
@@ -236,6 +252,12 @@ extension AppModel {
         guard !trimmed.isEmpty || !images.isEmpty else { return }
         // A second Return while the first new thread is still being made.
         if threadId == nil, creatingThread { return }
+        // Pictures pasted before the direct link was turned on, or before
+        // the draft moved to another runner: they'd go as paths on this Mac.
+        if !images.isEmpty, threadId == nil || thread != nil, let why = picturesRefusal(for: thread) {
+            errorMessage = why
+            return
+        }
         // A new thread on another runner goes over that runner's connection.
         if threadId == nil, let runnerId = newThreadRunnerId {
             return sendNewThread(on: runnerId, text: trimmed, draft: stored)
@@ -258,7 +280,8 @@ extension AppModel {
             }
         } else {
             let account = newThreadAccountId
-            let request = newThreadRequest(text: trimmed, images: draft.images)
+            var request = newThreadRequest(text: trimmed, images: draft.images)
+            if let project = newThreadProjectId, projects.contains(where: { $0.id == project }) { request.projectIds = [project] }
             creatingThread = true
             Task {
                 defer { creatingThread = false }
@@ -274,12 +297,13 @@ extension AppModel {
                     // from the defaults again, on whichever account then
                     // has the most room. The model and effort stick.
                     newThreadCwd = nil
+                    newThreadProjectId = nil
                     newThreadPermission = .full
                     newThreadAccount = nil
                     newThreadPool = nil
                     newThreadProvider = nil
                     threads[thread.id] = thread
-                    select(thread.id)
+                    showStartedThread(thread.id)
                     // "This Mac" was for this thread; the next starts on
                     // the default runner again.
                     newThreadRunnerPicked = false
@@ -465,22 +489,50 @@ extension AppModel {
         drafts[key] = restored
     }
 
-    func interrupt() {
-        guard let threadId = selection, let client = client(for: threadId) else { return }
-        Task { try? await client.interrupt(threadId: threadId) }
+    /// Stops a thread's turn (the open one unless it's told which: a panel's
+    /// composer can show another). The turn ends a moment after the runner
+    /// takes the stop, so the button keeps its spinner until the thread stops
+    /// being busy. `interruptWait` is a little past the runner's own limit
+    /// (INTERRUPT_GRACE_MS), and only then can it be pressed again.
+    func interrupt(_ threadId: String? = nil) {
+        guard let threadId = threadId ?? selection else { return }
+        guard let client = client(for: threadId) else {
+            let runner = threads[threadId].flatMap { runnerName(of: $0) } ?? "the runner"
+            return showConnectionError("Not connected to \(runner), so it wasn't stopped.")
+        }
+        whileBusy(BusyKey.stop(threadId)) { [self] in
+            do {
+                try await client.interrupt(threadId: threadId)
+                let deadline = ContinuousClock.now + Self.interruptWait
+                while threads[threadId]?.status.isBusy == true, ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            } catch {
+                show(error)
+            }
+        }
     }
+
+    /// A var only so tests can make it short.
+    static var interruptWait: Duration = .seconds(12)
 
     /// Changes a thread on the runner. What can safely be guessed (archived,
     /// snoozed, permission, model, effort) shows at once
     /// (`ThreadUpdate.applied`), so the click does something however slow
     /// the runner is; its reply replaces the guess, and a failure puts back
-    /// what was there unless something else has changed it since.
+    /// what was there unless something else has changed it since. What
+    /// can't be guessed (a folder, login or pool) has the composer's chip
+    /// spin until the reply (`BusyKey.moving`).
     func update(_ threadId: String, _ update: ThreadUpdate) {
         guard isRemote(threadId) || client != nil else { return }
         let before = threads[threadId]
         let guess = before.map { update.applied(to: $0) }
         if let guess, guess != before { threads[threadId] = guess }
+        let moving = update.cwd != nil ? BusyKey.movingFolder(threadId)
+            : update.accountId != nil || update.poolId != nil ? BusyKey.moving(threadId) : nil
+        if let moving { beginBusy(moving) }
         Task {
+            defer { if let moving { endBusy(moving) } }
             do {
                 // Made as a restarting runner lets go of its idle threads,
                 // as a send can be: Mike saw "Thread not found" picking an
@@ -545,6 +597,27 @@ extension AppModel {
         update(threadId, ThreadUpdate(starred: starred))
     }
 
+    /// Delete from the sidebar, only for an archived chat, after asking:
+    /// the runner moves its folder to its trash.
+    func deleteThread(_ threadId: String) {
+        guard !isBusy(BusyKey.deleteThread(threadId)), let thread = threads[threadId], thread.isArchived,
+              let client = client(for: threadId) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete \u{201C}\(thread.title)\u{201D}?"
+        alert.informativeText = "This removes the chat from Threadbear and moves it to the runner's trash. It can't be undone in the app."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        // It may have been unarchived while the alert was up.
+        guard alert.runModal() == .alertFirstButtonReturn, threads[threadId]?.isArchived == true else { return }
+        whileBusy(BusyKey.deleteThread(threadId), note: "Deleting chat…") { [self] in
+            do {
+                try await client.deleteThread(threadId)
+                forget(threadId)
+            } catch { show(error) }
+        }
+    }
+
     /// Archive (Mike calls it settling): leaves the inbox, stops its CLI.
     /// Its row slides off first, as a swiped one does;
     /// `slid` is a swipe that's already done that.
@@ -554,9 +627,16 @@ extension AppModel {
         if let thread = threads[threadId] {
             archivedNote = ArchivedNote(threadId: threadId, title: thread.title, wasOpen: selection == threadId)
             inboxEndNote = nil
+            milestoneNote = nil
         }
         if selection == threadId {
+            // The last thread left: the inbox is clear, and the pane goes
+            // to the new thread page.
+            let sections = sections
+            let clears = next == nil && ![sections.inbox, sections.running, sections.needsYou].joined().contains { $0.id != threadId }
+            if clears { inboxZeroBear = .due }
             flyToArchive(threadId)
+            if clears, !flyingToArchive.contains(threadId) { inboxZeroBear = .shown }
             select(next)
         }
         if slid { return update(threadId, ThreadUpdate(archived: true)) }
@@ -617,11 +697,40 @@ extension AppModel {
     /// thread open in a panel of its own.
     private func flyToArchive(_ threadId: String) {
         guard transcript.session?.threadId == threadId, transcript.session?.subagentId == nil else { return }
+        noteFlightLeaving(threadId)
         let started = ArchiveFlight.launch(from: transcript.scrollView) { [weak self] in
             self?.flyingToArchive.remove(threadId)
+            self?.leavingTheInbox.remove(threadId)
             self?.archiveLandings &+= 1
+            if self?.inboxZeroBear == .due { self?.inboxZeroBear = .shown }
         }
-        if started { flyingToArchive.insert(threadId) }
+        if started { flyingToArchive.insert(threadId) } else { leavingTheInbox.remove(threadId) }
+    }
+
+    /// The open thread's panel sinks into the Hibernating heading's moon
+    /// while the next thread fades in under it (`ArchiveFlight`). Call it
+    /// before the thread changes and the next one opens, as it pictures the
+    /// transcript as it is. A row hibernated without being open just leaves,
+    /// but the moon still stirs, so the eye knows where it went. A starred
+    /// thread stays in Starred however long it sleeps, so it has nowhere to
+    /// fly to: the panel changes over as it always did.
+    private func tuckIn(_ threadId: String) {
+        guard let thread = threads[threadId], !thread.isStarred, !thread.isArchived else { return }
+        let showing = selection == threadId && transcript.session?.threadId == threadId && transcript.session?.subagentId == nil
+        // Asked before it goes. A thread already asleep (hibernated again, or
+        // waiting on a schedule) counts: its heading is there and stays.
+        let headingThere = !flyingToHibernate.isEmpty || !sections.hibernating.isEmpty
+        if showing { noteFlightLeaving(threadId) }
+        let started = showing && ArchiveFlight.launch(from: transcript.scrollView, to: .hibernate, headingThere: headingThere) { [weak self] in
+            self?.flyingToHibernate.remove(threadId)
+            self?.leavingTheInbox.remove(threadId)
+            self?.moonStirs()
+        }
+        if started { flyingToHibernate.insert(threadId) } else { leavingTheInbox.remove(threadId); moonStirs() }
+    }
+
+    private func moonStirs() {
+        if !Juice.reduceMotion { hibernateLandings &+= 1 }
     }
 
     /// As long as a swiped row takes to leave (`RowSwipeController`).
@@ -652,6 +761,7 @@ extension AppModel {
     func snooze(_ threadId: String? = nil, until date: Date) {
         guard let threadId = threadId ?? selection else { return }
         let next = neighbour(of: threadId)
+        tuckIn(threadId)
         update(threadId, ThreadUpdate(snoozedUntil: .some(date)))
         if selection == threadId { select(next) }
     }
@@ -659,15 +769,21 @@ extension AppModel {
     /// Hibernate until when Mike said, in his words. The runner puts it
     /// away straight off (its row says Thinking… until the time is worked
     /// out); if the model can't say, it comes back and the banner says why.
+    /// The row goes at once, and comes back if the runner refuses.
     func hibernateWhen(_ threadId: String, said: String) {
         guard isRemote(threadId) || client != nil else { return }
         let next = neighbour(of: threadId)
+        let before = threads[threadId]
+        let guess = before?.hibernating(said: said)
+        tuckIn(threadId)
+        if let guess { threads[threadId] = guess }
         if selection == threadId { select(next) }
         Task {
             do {
                 let client = try await rowClient(for: threadId)
                 threads[threadId] = try await client.hibernateWhen(threadId: threadId, said: said)
             } catch {
+                if let before, threads[threadId] == guess { threads[threadId] = before }
                 show(error)
             }
         }
@@ -679,6 +795,7 @@ extension AppModel {
     func snoozeUntilRestart(_ threadId: String? = nil) {
         guard let threadId = threadId ?? selection else { return }
         let next = neighbour(of: threadId)
+        tuckIn(threadId)
         update(threadId, ThreadUpdate(snoozeUntilRestart: true))
         if selection == threadId { select(next) }
     }
@@ -887,7 +1004,7 @@ extension AppModel {
         }
     }
 
-    private func showConnectionError(_ message: String) {
+    func showConnectionError(_ message: String) {
         errorMessage = message
         connectionErrorMessage = message
     }

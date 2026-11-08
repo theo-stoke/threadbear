@@ -263,6 +263,21 @@ public struct ApprovalItem: Sendable, Hashable {
     /// Another runner asking for a thread: the request as it was filed,
     /// once this Mac's runner has read it (nil until then).
     public var startRequest: StartRequest?
+    /// The agent's other calls waiting behind this one, shown on the same
+    /// card (docs/protocol.md, "Queued calls"). Empty for most cards.
+    ///
+    /// Always empty on another runner's start request, and a start request
+    /// is never one of the queued calls. Both come from the runner that
+    /// owns the thread, which may be a secondary one: a queue on the card
+    /// swapped the request this Mac's runner read (where, which access, the
+    /// brief) for the runner's own harmless-looking calls, while Allow
+    /// still started what was filed (Daybreak, 8 Nov). A start request is
+    /// only ever shown and answered as itself.
+    public var queued: [ApprovalRequest] {
+        get { isStartRequest ? [] : queuedCalls }
+        set { queuedCalls = newValue.filter { $0.name != StartRequest.cardName } }
+    }
+    private var queuedCalls: [ApprovalRequest] = []
 
     public init(request: ApprovalRequest, resolution: ApprovalResolution? = nil, root: String? = nil, toolShown: Bool = false, startRequest: StartRequest? = nil) {
         self.request = request
@@ -315,6 +330,17 @@ public struct SecretItem: Sendable, Hashable {
         case .expired: return request.label + " · Request ended"
         default: return request.label + " · Declined"
         }
+    }
+}
+
+public extension RowContent {
+    /// The note a thread back from hibernating says so in. The runner words
+    /// it (`wake` in runner/src/runner/hibernation.ts), and every way it says
+    /// it starts like this. It's what Mike came to the thread to read, so it
+    /// never folds into the work above it, and it gets the bear.
+    var isWakeNote: Bool {
+        if case .note(let text) = self { return text.hasPrefix("Woke up") }
+        return false
     }
 }
 

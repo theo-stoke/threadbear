@@ -28,12 +28,12 @@ public enum ThreadLinks {
     /// (Mike, 1 Nov). Code spans stay as written, as they're being talked about.
     public static func escapeDestinations(_ markdown: String) -> String {
         guard markdown.contains("](work:") || markdown.contains("](thread:") else { return markdown }
-        let codeSpans = markdown.ranges(of: /`+[^`\n]*`+/)
+        var codeSpans = CodeSpans(markdown.ranges(of: /`+[^`\n]*`+/))
         var out = ""
         var from = markdown.startIndex
         // One level of brackets inside, for `work:npm test (unit)`.
         for match in markdown.matches(of: /\]\((work|thread):((?:[^()\n]|\([^()\n]*\))*)\)/) {
-            if codeSpans.contains(where: { $0.overlaps(match.range) }) { continue }
+            if codeSpans.overlap(match.range) { continue }
             out += markdown[from..<match.output.2.startIndex]
             let raw = String(match.output.2)
             out += (raw.removingPercentEncoding ?? raw).addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
@@ -105,7 +105,9 @@ public enum ThreadLinks {
         switch message.role {
         case .tool: normal(message.text).contains(q)
         // A line that links to a step isn't the step, nor is the summary.
-        case .assistant: !message.summary && normal(message.text.replacing(/\]\(work:[^)\n]*\)/, with: "]")).contains(q)
+        // One with no `)` uses up its line and stays: trying every `](work:`
+        // after it again was quadratic.
+        case .assistant: !message.summary && normal(message.text.replacing(/\]\(work:[^)\n]*(\))?/) { $0.1 == nil ? String($0.0) : "]" }).contains(q)
         case .user: false
         }
     }

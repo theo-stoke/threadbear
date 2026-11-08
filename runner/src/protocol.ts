@@ -17,6 +17,36 @@ export function isProvider(v: unknown): v is Provider {
 // reads and plans but changes nothing until Mike approves its plan
 // (docs/protocol.md, "Plan first").
 export type PermissionMode = 'full' | 'ask' | 'auto' | 'plan';
+export const PERMISSION_MODES: readonly PermissionMode[] = ['full', 'ask', 'auto', 'plan'];
+
+// Every place a mode crosses from one process to another checks it with
+// this, so a mode added later can't be dropped by one hop's own list and
+// leave the thread on the full-access default (Daybreak, 7 Nov 2026: Plan
+// first sent to another Mac arrived as Full access).
+export function isPermissionMode(v: unknown): v is PermissionMode {
+  return typeof v === 'string' && (PERMISSION_MODES as readonly string[]).includes(v);
+}
+
+// A new thread's mode in a `create` command another runner takes through
+// the backend (docs/protocol.md, "Other runners' threads through the
+// backend"). Plan first goes as Ask with `plan: true`: a runner or backend
+// from before it knew Plan first drops the flag and starts the thread on
+// Ask, never on the full access a missing mode means. Unknown modes are
+// refused, not dropped.
+export function remoteCreateMode(mode: unknown): Record<string, unknown> {
+  if (mode === undefined || mode === null) return {};
+  if (!isPermissionMode(mode)) throw new RpcError(ErrorCode.badParams, `permissionMode must be one of ${PERMISSION_MODES.join(', ')}`);
+  return mode === 'plan' ? { permissionMode: 'ask', plan: true } : { permissionMode: mode };
+}
+
+// What the runner taking a `create` command starts the thread on: undefined
+// (the default) only when the command names no mode at all.
+export function remoteCreateModeOf(a: { permissionMode?: unknown; plan?: unknown }): PermissionMode | undefined {
+  if (a.plan === true) return 'plan';
+  if (a.permissionMode === undefined || a.permissionMode === null) return undefined;
+  if (!isPermissionMode(a.permissionMode)) throw new Error(`Unknown permission mode ${JSON.stringify(a.permissionMode)}: the thread wasn't started.`);
+  return a.permissionMode;
+}
 // 'ultra' is Codex's multi-agent level; Claude never offers it.
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 export const EFFORT_LEVELS: readonly EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
@@ -256,8 +286,11 @@ export type PanelPlace = 'tab' | 'left' | 'right' | 'top' | 'bottom' | 'window';
 export type PanelRequest = {
   id: string;
   panel: string; // "highlights", "patches", "usage", "updates", "connectors", or one of the thread's panels' ids
-  title: string; // "Highlights", "Convex"
+  title: string; // "Highlights", "Convex"; with highlight, the pin's title
   where?: PanelPlace;
+  // pin with show: the highlight to open in the pane, over Highlights. An
+  // app that doesn't know this opens Highlights.
+  highlight?: string;
   at: string;
 };
 
@@ -577,6 +610,11 @@ export type PlanEntry = { text: string; status: 'pending' | 'in_progress' | 'com
 export type ApprovalOption = 'allow' | 'allowAlways' | 'deny';
 export type ApprovalDecision = 'allow' | 'allowAlways' | 'deny' | 'answered' | 'expired';
 
+// A call waiting behind an approval card, as its own card would show it.
+export type QueuedCall = { itemId: string; name: string; title: string; input: Record<string, unknown> };
+// How Mike answered each queued call, by itemId.
+export type QueuedAnswers = Record<string, 'allow' | 'deny'>;
+
 export type Question = {
   question: string;
   header?: string;
@@ -694,6 +732,9 @@ export type EventBody =
       input: Record<string, unknown>;
       options: ApprovalOption[];
     }
+  // The agent's other calls from the same reply, waiting behind this card
+  // (docs/protocol.md, "Queued calls"). A later one replaces the list.
+  | { type: 'approval.queued'; approvalId: string; calls: QueuedCall[] }
   | { type: 'question.requested'; approvalId: string; itemId?: string; questions: Question[] }
   // An agent's ask_secret (docs/protocol.md, "Secrets"): never the value.
   | { type: 'secret.requested'; approvalId: string; itemId?: string; label: string; reason: string; placeholder?: string }
@@ -793,6 +834,7 @@ export const PERSISTED_TYPES = new Set<string>([
   'tool.result',
   'edit.diff',
   'approval.requested',
+  'approval.queued',
   'question.requested',
   'secret.requested',
   'approval.resolved',

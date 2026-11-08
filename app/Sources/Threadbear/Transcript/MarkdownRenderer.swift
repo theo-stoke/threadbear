@@ -79,6 +79,25 @@ enum MarkdownRenderer {
         return cache
     }()
 
+    /// Whether a picture in the words (`![](/path/shot.png)`) may be read
+    /// from this Mac and drawn: not for another Mac's thread, whose paths
+    /// are that Mac's, as a runner could otherwise put any picture on this
+    /// Mac into its reply (Codex review, 7 Nov). Set for one render on the
+    /// thread doing it (RenderCache.render), so the cache keys on it too.
+    static var localPictures: Bool {
+        (Thread.current.threadDictionary[localPicturesKey] as? Bool) ?? true
+    }
+
+    private static let localPicturesKey = "com.mikerosoft.threadbear.localPictures"
+
+    static func withLocalPictures<T>(_ allowed: Bool, _ body: () -> T) -> T {
+        let dictionary = Thread.current.threadDictionary
+        let saved = dictionary[localPicturesKey]
+        dictionary[localPicturesKey] = allowed
+        defer { dictionary[localPicturesKey] = saved }
+        return body()
+    }
+
     static func render(_ text: String) -> Rendered {
         let blocks = MarkdownBlocks.split(text)
         let output = NSMutableAttributedString()
@@ -108,19 +127,64 @@ enum MarkdownRenderer {
         return NSAttributedString(string: "\u{200B}\n", attributes: [.font: NSFont.systemFont(ofSize: 1), .paragraphStyle: style])
     }()
 
+    /// How deep quotes and lists may nest before a block is drawn as words.
+    static let maxNesting = 32
+    /// Emphasis, links and pictures nest too (`*a *b … b* a*`, `![![x](u)](u)`),
+    /// a level for each of these marks at most. A block with more than a
+    /// few is parsed on a thread with room for every level; past the most
+    /// it's words.
+    static let inlineMarksOnWorkerStack = 48
+    static let maxInlineMarks = 4_000
+    /// Short rows are padded to a table's header, so 9 KB can ask for 1.6
+    /// million cells (cross-lab review, 7 Nov 2026). Past this it's words.
+    static let maxTableCells = 20_000
+
     static func renderBlock(_ block: String) -> NSAttributedString {
+        // Counted in what the parser gets: escaping work: links decodes
+        // `%2A` into `*` (cross-lab review, 7 Nov 2026).
+        let marks = MarkdownNesting.inlineMarks(WorkLinks.escapeDestinations(block))
+        guard marks > inlineMarksOnWorkerStack, marks <= maxInlineMarks else { return renderBlockHere(block) }
+        // 256 MB holds 4,000 levels with room to spare (each takes a few KB
+        // between swift-markdown and the Builder); a worker's is 512 KB.
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var result: NSAttributedString?
+        let thread = Thread {
+            result = renderBlockHere(block)
+            done.signal()
+        }
+        thread.stackSize = 256 << 20
+        thread.start()
+        done.wait()
+        return result ?? NSAttributedString(string: block)
+    }
+
+    private static func renderBlockHere(_ block: String) -> NSAttributedString {
         // The zoom is in the key: a block's layout is all sizes. A block
         // that may hold a ```mermaid or ```html box also keys on whether
         // those have been drawn, or flipped to their source (RichBlocks).
         let rich = RichBlocks.mayHoldRich(block)
         // One that links a reply button keys on the buttons' states.
         let buttons = ReplyButtons.mayHold(block) ? ReplyButtons.shared.generation : -1
-        let key = "\(TypeScale.percent)|\(rich ? RichBlocks.shared.generation : -1)|\(buttons)|\(block)" as NSString
+        let key = "\(TypeScale.percent)|\(rich ? RichBlocks.shared.generation : -1)|\(buttons)|\(localPictures ? 1 : 0)|\(block)" as NSString
         if let cached = cache.object(forKey: key) { return cached }
         // `[tests pass](work:npm test)`: a space ends a link's destination
         // for the parser, so work: and thread: links are escaped first.
-        let document = Document(parsing: WorkLinks.escapeDestinations(block), options: [.disableSmartOpts])
         var builder = Builder()
+        // Quotes or lists nested past this are plain words: parsing and
+        // drawing them recurse once a level, on worker threads with small
+        // stacks, and 8,000 `>`s from a reply ran one out (Daybreak, 7 Nov
+        // 2026). Nothing anyone writes nests this deep.
+        let source = WorkLinks.escapeDestinations(block)
+        if MarkdownNesting.bound(source) > maxNesting || MarkdownNesting.inlineMarks(source) > maxInlineMarks || MarkdownNesting.tableCells(source) > maxTableCells {
+            let start = builder.output.length
+            builder.append(block, Context())
+            builder.finishParagraph(from: start, style: builder.paragraphStyle(Context()))
+            builder.trimTrailingNewline()
+            let result = NSAttributedString(attributedString: builder.output)
+            cache.setObject(result, forKey: key, cost: block.utf16.count)
+            return result
+        }
+        let document = Document(parsing: source, options: [.disableSmartOpts])
         // Split where cmark ends lines: "\n", "\r" and "\r\n" (one
         // Character), not U+2028 and the other separators Swift counts.
         if rich || DraftBlock.mayHold(block) {
@@ -767,7 +831,7 @@ enum MarkdownRenderer {
                 let alt = image.plainText.isEmpty ? (image.source ?? "image") : image.plainText
                 // A picture on this Mac is drawn in the text; a web address,
                 // or a file that's gone, stays a link with its alt text.
-                if let url = inner.link, url.isFileURL, let attachment = MarkdownRenderer.picture(path: url.path, alt: alt) {
+                if let url = inner.link, url.isFileURL, MarkdownRenderer.localPictures, let attachment = MarkdownRenderer.picture(path: url.path, alt: alt) {
                     let run = NSMutableAttributedString(attachment: attachment)
                     run.addAttributes([.link: url, .toolTip: alt], range: NSRange(location: 0, length: run.length))
                     output.append(run)

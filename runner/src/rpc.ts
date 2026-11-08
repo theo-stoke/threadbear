@@ -19,6 +19,10 @@ type Conn = {
   authed: boolean;
   subs: Set<string>;
   client?: string;
+  // hello's version and pid, and when it connected, for the log.
+  clientVersion?: string;
+  clientPid?: number;
+  since: number;
   browserPanel?: boolean;
   authTimer?: AwakeTimer;
   // This connection's auth.challenge nonce (docs/protocol.md, "Auth").
@@ -294,7 +298,7 @@ export class RpcServer {
   }
 
   private onConnection(ws: WebSocket, headerAuthed: boolean): void {
-    const conn: Conn = { id: this.nextId++, ws, authed: false, subs: new Set() };
+    const conn: Conn = { id: this.nextId++, ws, authed: false, subs: new Set(), since: Date.now() };
     this.conns.add(conn);
     if (headerAuthed) {
       this.unlock(conn);
@@ -336,7 +340,10 @@ export class RpcServer {
   private write(conn: Conn, msg: string, skippable: boolean): void {
     const buffered = conn.ws.bufferedAmount;
     if (buffered > (this.opts.closeBytes ?? CLOSE_BYTES)) {
-      this.opts.log.warn('client is not reading; closing it', { conn: conn.id, client: conn.client, buffered });
+      this.opts.log.warn('client is not reading; closing it', {
+        conn: conn.id, client: conn.client ?? 'no hello', version: conn.clientVersion, pid: conn.clientPid,
+        subs: conn.subs.size, connectedSecs: Math.round((Date.now() - conn.since) / 1000), buffered,
+      });
       conn.ws.close(4408, 'too far behind');
       this.conns.delete(conn);
       return;
@@ -485,6 +492,8 @@ export class RpcServer {
         return {};
       case 'hello': {
         conn.client = optString(p, 'client');
+        conn.clientVersion = typeof p.version === 'string' ? p.version : undefined;
+        conn.clientPid = typeof p.pid === 'number' ? p.pid : undefined;
         conn.browserPanel = p.browserPanel === true;
         // Only the Mac app's own builds: a dev build has none.
         const build = p.build as Record<string, unknown> | undefined;
@@ -500,8 +509,10 @@ export class RpcServer {
         for (const x of include ?? []) {
           if (x !== 'inbox' && x !== 'snoozed' && x !== 'archived') throw bad(`unknown include value ${x}`);
         }
-        const local = r.list(include as Bucket[] | undefined);
-        const remote = this.opts.remote?.summaries((include as Bucket[] | undefined) ?? ['inbox']);
+        const ids = p.ids === undefined ? undefined : stringArray(p, 'ids');
+        const local = r.list(include as Bucket[] | undefined, ids);
+        const only = ids && new Set(ids);
+        const remote = this.opts.remote?.summaries((include as Bucket[] | undefined) ?? ['inbox']).filter((t) => !only || only.has(t.id));
         return { threads: remote?.length ? mergeSummaries(local, remote) : local };
       }
       case 'threads.search': {
@@ -534,7 +545,11 @@ export class RpcServer {
           permissionMode: optMode(p),
           title: optString(p, 'title'),
           ...(p.worktree === false ? { worktree: false } : {}),
+          // Only ever narrows (a draining runner passing on a sandboxed
+          // agent's create_thread), so any client may ask for it.
+          ...(p.confined === true ? { confined: true } : {}),
           ...optStartedBy(p),
+          ...optProjectIds(p),
         });
         return { thread: res.thread, turnId: res.turnId };
       }
@@ -561,7 +576,8 @@ export class RpcServer {
       case 'threads.edit':
         return r.editMessage(reqString(p, 'threadId'), reqNumber(p, 'seq'), optString(p, 'text') ?? '', optImages(p) ?? [], { stopBackground: p.stopBackground === true });
       case 'threads.interrupt':
-        return r.interrupt(reqString(p, 'threadId'));
+        // Sent on for an agent's interrupt_thread (handover.ts), it isn't his Stop.
+        return r.interrupt(reqString(p, 'threadId'), { byMike: p.byAgent !== true });
       case 'threads.update': {
         const upd: Parameters<Runner['update']>[0] = { threadId: reqString(p, 'threadId') };
         if (p.title !== undefined) upd.title = reqString(p, 'title');
@@ -571,6 +587,10 @@ export class RpcServer {
         }
         if (p.cwd !== undefined) upd.cwd = reqString(p, 'cwd');
         if (p.accountId !== undefined) upd.accountId = reqString(p, 'accountId');
+        // From a client with the runner's token (the app, tb): its move may
+        // take a thread out of a sandbox, unless it says it mayn't (a
+        // draining runner passing on an agent's move: unconfine false).
+        if (p.cwd !== undefined || p.accountId !== undefined || p.poolId !== undefined) upd.unconfine = p.unconfine !== false;
         if (p.poolId !== undefined) upd.poolId = p.poolId === null ? null : reqString(p, 'poolId');
         if (p.model !== undefined) upd.model = p.model === null ? null : reqString(p, 'model');
         if (p.effort !== undefined) upd.effort = p.effort === null ? null : optEffort(p);
@@ -670,12 +690,26 @@ export class RpcServer {
             answers[k] = Array.isArray(v) ? v.map(String).join(', ') : String(v);
           }
         }
+        // Answers to the calls queued on the card (docs/protocol.md, "Queued calls").
+        let queued: Record<string, 'allow' | 'deny'> | undefined;
+        if (p.queued !== undefined) {
+          if (!p.queued || typeof p.queued !== 'object' || Array.isArray(p.queued)) throw bad('queued must be an object');
+          queued = {};
+          for (const [k, v] of Object.entries(p.queued)) {
+            if (v !== 'allow' && v !== 'deny') throw bad('each queued answer is "allow" or "deny"');
+            queued[k] = v;
+          }
+        }
         return r.respondApproval({
           threadId: reqString(p, 'threadId'),
           approvalId: reqString(p, 'approvalId'),
           decision,
           message: optString(p, 'message'),
           answers,
+          ...(queued ? { queued } : {}),
+          // A draining runner passing on the phone's answer (handover.ts):
+          // it only ever narrows what counts, so any client may say it.
+          ...(p.remote === true ? { remote: true } : {}),
         });
       }
       case 'plans.approve':
@@ -871,4 +905,12 @@ function optImages(p: Record<string, unknown>): ImageRef[] | undefined {
     if (!x || typeof x !== 'object' || typeof (x as ImageRef).path !== 'string') throw bad('each image needs a path');
     return x as ImageRef;
   });
+}
+
+// threads.create's projectIds: project ids, the thread joining each before its first turn.
+function optProjectIds(p: Record<string, unknown>): { projectIds?: string[] } {
+  const v = p.projectIds;
+  if (v === undefined || v === null) return {};
+  if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' || !x)) throw bad('projectIds must be a list of project ids');
+  return v.length ? { projectIds: v as string[] } : {};
 }

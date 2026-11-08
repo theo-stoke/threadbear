@@ -187,6 +187,20 @@ enum Automation {
             try? await Task.sleep(for: .milliseconds(15))
         }
         guard let window = SettingsWindow.current, window.isVisible else { return "error the Settings window didn't open" }
+        // {"front": true}: in front and key, for real events on a desktop
+        // nobody's using (Tinker Desk). Says its number and where it is, top
+        // left, in screen points. A gesture of SwiftUI's own ignores a window
+        // that isn't key, so `point` can't reach those behind Mike's windows.
+        if c["front"] as? Bool == true {
+            // Floating: macOS can refuse a script's activate, and then a
+            // normal window stays under whatever's in front.
+            window.level = .floating
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            let top = (NSScreen.screens.first?.frame.height ?? 0) - window.frame.maxY
+            return "ok front \(window.windowNumber) \(Int(window.frame.minX)) \(Int(top))"
+        }
         window.tuckBehind()
         // Let the tab switch and the window's new height settle.
         try? await Task.sleep(for: .milliseconds(400))
@@ -329,9 +343,12 @@ enum Automation {
             // (points from the window's top left), with "toX" and "toY" drags there,
             // and "scrollX"/"scrollY" is a wheel, in lines. They go straight
             // to the window, so Mike's pointer stays where it is.
-            // {"review": id}: in that review's own window.
+            // {"review": id}: in that review's own window. {"settings": true}:
+            // in the Settings window. "holdMs" waits with the button still
+            // down at the end of a drag, for a `shot` of it mid-drag.
             let reviewWindow = (c["review"] as? String).flatMap { id in app.reviewWindows.values.first { $0.session.review.id == id }?.window }
-            guard let window = reviewWindow ?? window, let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error point needs x and y" }
+            let settingsWindow = c["settings"] as? Bool == true ? SettingsWindow.current : nil
+            guard let window = reviewWindow ?? settingsWindow ?? window, let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error point needs x and y" }
             let at = { (px: Double) in NSPoint(x: px, y: window.frame.height - y) }
             // Anywhere on the way from the start to (toX, toY), `t` from 0 to 1.
             let endY = (c["toY"] as? Double) ?? y
@@ -381,6 +398,7 @@ enum Automation {
                     try? await Task.sleep(for: .milliseconds(16))
                 }
             }
+            if let hold = c["holdMs"] as? Double { try? await Task.sleep(for: .milliseconds(hold)) }
             if let up = mouse(.leftMouseUp, along(1, end)) { window.sendEvent(up) }
             try? await Task.sleep(for: .milliseconds(350))
             return "ok"
@@ -566,14 +584,6 @@ enum Automation {
             target.concludeDragOperation(drag)
             target.draggingEnded(drag)
             return dropped ? "ok dropped on \(type(of: target))" : "error \(type(of: target)) turned it away"
-        case "browser":
-            // {"cmd":"browser","do":"click|right|scroll|key|type","x":,"y":,...}: real
-            // NSEvents to the Browser panel's page, in the page's own points,
-            // through the window as Mike's would go, without the pointer.
-            guard let window = mainWindow, let content = window.contentView,
-                  let view = all(AgentSurfaceView.self, in: content).last(where: { !$0.isHiddenOrHasHiddenAncestor })
-            else { return "error no browser panel" }
-            return view.automate(c, in: window)
         case "click":
             // A visible, enabled button in the transcript with this title,
             // or this accessibility label for an icon-only one. `tip` instead
@@ -598,6 +608,18 @@ enum Automation {
                 .filter { ($0.title == title || $0.accessibilityLabel() == title) && $0.isEnabled && !$0.isHiddenOrHasHiddenAncestor }
             guard let button = buttons.last else { return "error no button \(title)" }
             button.performClick(nil)
+            return "ok"
+        case "click-at":
+            // A click at a point in the main window, in points from its
+            // top left, through the window as a real one goes, without moving
+            // the pointer. For what has no tooltip to find it by.
+            guard let window, let x = c["x"] as? Double, let y = c["y"] as? Double else { return "error needs x and y" }
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                guard let event = NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: window.frame.height - y), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                                     windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+                else { return "error no event" }
+                window.sendEvent(event)
+            }
             return "ok"
         case "press-button":
             // {"cmd":"press-button","id":"b7k2abcd"} (or "title":"Fill in the
@@ -635,6 +657,10 @@ enum Automation {
             guard let id = target.id else { return target.error }
             app.setStarred(id, name == "star")
             return "ok \(id)"
+        case "milestone":
+            // Scripted runs never earn the note, so this is how to see it.
+            app.milestoneNote = MilestoneNote(tier: c["tier"] as? Int ?? 1000)
+            return "ok"
         case "undo-archive":
             // The Archived note's Undo.
             guard let id = app.archivedNote?.threadId else { return "error no archived note" }
@@ -966,7 +992,8 @@ enum Automation {
             return "ok"
         case "project":
             // {"cmd":"project","id":"p_…"} opens a project's page in the
-            // detail area; {"cmd":"project","close":true} closes it.
+            // detail area; {"cmd":"project","close":true} closes it, and
+            // "newThread" true is the page's New Thread button.
             if c["close"] as? Bool == true {
                 app.openProjectId = nil
                 return "ok"
@@ -976,6 +1003,11 @@ enum Automation {
             }
             guard app.project(id) != nil else { return "error no project \(id); there are \(app.projects.map(\.id).joined(separator: ", "))" }
             app.openProjectPage(id)
+            if c["newThread"] as? Bool == true, let project = app.project(id) {
+                app.newThread(in: project)
+                try? await Task.sleep(for: .milliseconds(200))
+                return "ok new thread in \(app.newThreadProjectId ?? "no project"), folder \(app.newThreadCwd ?? "default")"
+            }
             try? await Task.sleep(for: .milliseconds(200))
             return "ok"
         case "close-schedule":
@@ -1169,6 +1201,32 @@ enum Automation {
             return composer.debugHoverChip(number).map { "ok window \($0)" } ?? "error no chip \(number) with a card"
         case "select-text":
             return select(c, app: app)
+        case "app-menu":
+            // The Threadbear menu's items, as it opens: titles with their
+            // keys, separators as "-".
+            guard let menu = NSApp.mainMenu?.items.first?.submenu else { return "error no app menu" }
+            menu.update()
+            return "ok " + json(menu.items.map { item in
+                item.isSeparatorItem ? "-" : item.title + (item.keyEquivalent.isEmpty ? "" : " [\(item.keyEquivalent)]")
+            })
+        case "den":
+            // Threadbear > About Threadbear, through the menu item itself.
+            guard let menu = NSApp.mainMenu?.items.first?.submenu,
+                  let index = menu.items.firstIndex(where: { $0.title == "About Threadbear" }) else { return "error no About Threadbear in the app menu" }
+            menu.update()
+            menu.performActionForItem(at: index)
+            try? await Task.sleep(for: .milliseconds(200))
+            return DenWindow.current?.isVisible == true ? "ok " + menu.items.prefix(3).map(\.title).joined(separator: " | ") : "error the Den didn't open"
+        case "room":
+            // Every login's room, as the honey pot and Usage see it:
+            // {"percent": 44}. Lasts until the runner next says otherwise.
+            guard let percent = c["percent"] as? Double else { return "error needs percent" }
+            app.accounts = app.accounts.map {
+                var account = $0
+                account.usage = AccountUsage(windows: [UsageWindow(kind: "weekly", title: "Weekly", remainingPercent: percent)])
+                return account
+            }
+            return "ok"
         case "account-ids":
             // For screenshots: accounts are titled by their email address,
             // so show their ids instead. Lasts until the next reconnect.
@@ -1216,6 +1274,8 @@ enum Automation {
             guard let path = c["path"] as? String, path.hasPrefix("/") else { return "error path must be absolute" }
             if let refused = refusesToWrite(path) { return refused }
             guard var window else { return "error no window" }
+            // {"den": true}: About Threadbear (open it with `den`).
+            if c["den"] as? Bool == true, let den = DenWindow.current { window = den }
             // {"review": id}: its own window.
             if let id = c["review"] as? String {
                 if let review = app.reviewWindows.values.first(where: { $0.session.review.id == id })?.window {
@@ -1284,6 +1344,20 @@ enum Automation {
             return "ok \(window.windowNumber) \(Int(size.width))x\(Int(size.height))"
         case "settings":
             return await settings(c, app: app)
+        case "runners-front":
+            // The Runners panel open and the main window floating in front
+            // and key, for real events on a desktop nobody's using (Tinker
+            // Desk, app/README.md "A real drag"). Says the window's number
+            // and top left in screen points.
+            guard let window else { return "error no window" }
+            app.runnersShown = true
+            window.level = .floating
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            try? await Task.sleep(for: .milliseconds(400))
+            let top = (NSScreen.screens.first?.frame.height ?? 0) - window.frame.maxY
+            return "ok \(window.windowNumber) \(Int(window.frame.minX)) \(Int(top))"
         case "shortcuts":
             return await shortcuts(c)
         case "focus":

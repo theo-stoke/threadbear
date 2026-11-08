@@ -36,10 +36,24 @@ export const newThreadsPart = {
     // worktree per thread.
     worktree?: boolean;
     startedBy?: ThreadStartedBy;
+    // Started by a sandboxed thread's agent in a sandbox folder: shut in
+    // one too (ThreadRecord.confined).
+    confined?: boolean;
+    // Projects it starts in (New Thread on a project's page), joined
+    // before its first turn, so that turn already has the project's brief.
+    projectIds?: string[];
   }): { thread: ThreadSummary; turnId: string } {
     if (!params.text && !params.images?.length) throw new RpcError(ErrorCode.badParams, 'text or images required');
     checkImages(params.images ?? []);
+    const projectIds = params.projectIds ?? [];
+    if (projectIds.length) {
+      const projects = this.projects;
+      if (!projects) throw new RpcError(ErrorCode.badParams, 'projects are not available on this runner');
+      // Every one checked before the thread exists: a bad id makes nothing.
+      for (const p of projectIds) projects.get(p);
+    }
     const { st, notes } = this.makeThread(params);
+    if (projectIds.length) this.projects!.changeMembership(st.rec.id, { add: projectIds, by: 'mike' });
     const turnId = this.sendTo(st, params.text ?? '', params.images ?? [], { origin: params.origin, scheduleId: params.scheduleId });
     // Under the first turn, so they read as part of starting it.
     for (const text of notes) this.emit(st, { type: 'system.note', text }, st.rt.turn?.turnId ?? turnId);
@@ -153,6 +167,7 @@ export const newThreadsPart = {
     scheduleId?: string;
     worktree?: boolean;
     startedBy?: ThreadStartedBy;
+    confined?: boolean;
   }): { st: ThreadState; notes: string[] } {
     this.checkAccepting();
     // New threads belong on the new release.
@@ -173,6 +188,13 @@ export const newThreadsPart = {
     if (!account) throw new RpcError(ErrorCode.accountNotFound, `No account called ${accountId}`);
     this.checkProvider(account);
     if (!isDirectory(cwd)) throw new RpcError(ErrorCode.badParams, `Folder not found: ${cwd}`);
+    // In a sandbox folder a Claude thread is shut in it from the start. One
+    // asked for that which can't be (a Codex login, a folder outside) is
+    // refused rather than started outside (sandbox.ts).
+    const sandboxed = account.provider === 'claude' && this.sandboxed(cwd);
+    if (params.confined && !sandboxed) {
+      throw new RpcError(ErrorCode.badParams, account.provider === 'claude' ? `${cwd} isn't in a sandbox folder, and a sandboxed thread can only start threads in one without asking.` : "A sandboxed thread can only start Claude threads, as Codex doesn't run in the sandbox.");
+    }
     const now = this.isoNow();
     const id = crypto.randomUUID();
     const rec: ThreadRecord = {
@@ -184,6 +206,7 @@ export const newThreadsPart = {
       ...(poolId ? { poolId } : {}),
       provider: account.provider,
       permissionMode: params.permissionMode ?? 'full',
+      ...(sandboxed ? { confined: true as const } : {}),
       status: 'idle',
       createdAt: now,
       updatedAt: now,

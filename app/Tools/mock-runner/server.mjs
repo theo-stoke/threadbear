@@ -294,6 +294,7 @@ const devices = [
 let deviceSeq = devices.length;
 const deviceList = () => ({ devices: [...devices], site: DEMO_SITE });
 
+let mockInstructions = { text: '' };
 const settings = {
   defaultCwd: defaults.cwd, idleMinutes: 30, maxLiveCLIs: 6, followMain: true, bulletReplies: true, oneReply: true,
   models: {
@@ -331,7 +332,13 @@ const BRUCE = 'runner_bruce';
 // Mike's runner order (backend API 58), every runner's id: set with
 // runners.setOrder and said back in remoteThreads.updated, as the real
 // runner passes on the backend's.
-let runnerOrder = ['runner_mock', BRUCE];
+// MOCK_MORE_RUNNERS=1 adds two more, for a list worth rearranging (only for
+// a look at Settings > Runners: the usual demo stays at two).
+const MORE_RUNNERS = process.env.MOCK_MORE_RUNNERS ? [
+  { id: 'runner_cloud', name: 'Hetzner Cloud', icon: 'cloud', online: true, lastSeenAt: new Date().toISOString() },
+  { id: 'runner_pixel', name: 'Pixel', icon: 'smartphone', online: true, lastSeenAt: new Date().toISOString() },
+] : [];
+let runnerOrder = ['runner_mock', BRUCE, ...MORE_RUNNERS.map((r) => r.id)];
 // Files on bruce's Mac that its threads name, for files.read from
 // /bruce/rpc (docs/protocol.md, "Other runners' threads"): the picture is a
 // real PNG, the rest text. None of these paths exist on this Mac.
@@ -341,7 +348,7 @@ const BRUCE_FILES = {
   blob: '/Users/bruce/Library/Application Support/Threadbear/threads/bruce_media/blobs/bruce_media_c0_0.txt',
 };
 const bruceModifiedAt = new Date(Date.now() - 3600_000).toISOString();
-addRemoteDemo();
+if (!process.env.TB_MOCK_NO_REMOTE) addRemoteDemo();
 /** The schedules (docs/protocol.md, "Schedules"), soonest first. */
 let schedules = [];
 addDemoSchedules();
@@ -616,6 +623,8 @@ async function dispatch(client, method, p) {
     }
     case 'threads.create': {
       if (!p.text) throw rpcError(-32602, 'text is required');
+      // New Thread on a project's page: every project checked first, as the runner does.
+      const startIn = (p.projectIds ?? []).map((id) => needProject(id));
       const threadId = 'th_' + crypto.randomBytes(6).toString('hex');
       const now = iso();
       // Like the runner: a login named pins the thread; otherwise a pool
@@ -637,7 +646,9 @@ async function dispatch(client, method, p) {
       // `fresh`: started this session, so the librarian files it after its first turn
       // (librarianFiles). The demo fixtures never are, so nothing they show changes.
       threads.set(threadId, { summary, events: [], inProgress: new Map(), timers: [], fresh: true, ...(client.as ? { runnerId: client.as } : {}) });
+      for (const project of startIn) join(summary, project, 'mike', true);
       broadcastSummary(threadId);
+      if (startIn.length) broadcastProjects();
       setTimeout(() => fakeTurn(threadId, p.text, p.images ?? []), 10);
       return { thread: summary };
     }
@@ -679,6 +690,13 @@ async function dispatch(client, method, p) {
       const turnId = 'turn_' + crypto.randomBytes(4).toString('hex');
       setTimeout(() => fakeTurn(t.summary.id, p.text ?? '', p.images ?? [], turnId, undefined, { editOf: p.seq }), 10);
       return { turnId, rewound: { seq: rewound.seq, fromSeq: rewound.fromSeq, toSeq: rewound.toSeq, files } };
+    }
+    case 'threads.delete': {
+      const t = need(p.threadId);
+      if (t.interrupt) t.interrupt();
+      threads.delete(t.summary.id);
+      broadcast('thread.deleted', { threadId: t.summary.id });
+      return {};
     }
     case 'threads.interrupt': {
       const t = need(p.threadId);
@@ -1056,7 +1074,7 @@ async function dispatch(client, method, p) {
           ];
       const skills = [
         { name: 'code-review', description: 'Review the current diff, or a PR number, branch or path, for correctness bugs, at the effort level given first.', argumentHint: '[low|medium|high] [target]', source: 'skill', scope: 'user', path: `${os.homedir()}/.claude/skills/code-review/SKILL.md` },
-        { name: 'computercub', description: "Drive Mac apps and the parts of Chrome extensions can't reach.", source: 'skill' },
+        { name: 'computercub', description: "Drive Mac apps and the parts of Chrome extensions can't reach, with the `computercub` command.", source: 'skill' },
         { name: 'cloudflare', description: 'Cloudflare platform: Workers, Pages, KV, D1, R2 and the rest.', source: 'skill' },
         { name: 'claude-api', description: 'Model ids, pricing, params and the Anthropic SDK.', source: 'skill' },
         { name: 'deslop', description: 'A second-pass cleanup over AI-written code using the repo style guide.', source: 'skill', scope: 'project', path: `${t.summary.cwd}/.claude/skills/deslop/SKILL.md` },
@@ -1089,9 +1107,11 @@ async function dispatch(client, method, p) {
       list.highlights = list.highlights.filter((h) => h.id !== id);
       list.highlights.unshift({
         id, kind, title: p.title ?? (p.path ? path.basename(p.path) : p.url), path: p.path, url: p.url, how: 'pinned',
-        note: p.note, ...(p.show ? { show: true } : {}), seq: t.summary.lastSeq, lastSeq: t.summary.lastSeq, at: iso(),
+        note: p.note, seq: t.summary.lastSeq, lastSeq: t.summary.lastSeq, at: iso(),
       });
       t.summary.highlightsAt = iso();
+      // show is a panel request naming the pin, as the runner's (docs/protocol.md, "Highlights").
+      if (p.show) t.summary.panelRequest = { id: 'pr_' + crypto.randomBytes(4).toString('hex'), panel: 'highlights', title: list.highlights[0].title, highlight: id, at: iso() };
       broadcastSummary(t.summary.id);
       return { highlight: list.highlights[0] };
     }
@@ -1153,7 +1173,8 @@ async function dispatch(client, method, p) {
           ...(r.self
             ? { version: '0.1.0+20261105T064853Z-c4d90ca', release: '20261105T064853Z-c4d90ca', startedAt: iso(-16 * 60_000) }
             : { version: '0.1.0+20261104T221010Z-51ae514', release: '20261104T221010Z-51ae514', startedAt: iso(-26 * 3_600_000) }),
-        })),
+        })).concat(MORE_RUNNERS.map((r) => ({ id: r.id, name: r.name, icon: r.icon, online: true, lastSeenAt: iso(), self: false,
+          version: '0.1.0+20261104T221010Z-51ae514', release: '20261104T221010Z-51ae514', startedAt: iso(-3 * 3_600_000) }))),
       };
     case 'runners.stats': {
       // Each runner's machine figures, a little different each ask.
@@ -1250,6 +1271,12 @@ async function dispatch(client, method, p) {
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       if (p.refresh) connectors = { ...connectors, checkedAt: iso() };
       return { connectors };
+    case 'instructions.get':
+      return { instructions: mockInstructions };
+    case 'instructions.set':
+      mockInstructions = { text: p.text.trim() ? p.text.trim() + '\n' : '' };
+      broadcast('instructions.updated', { instructions: mockInstructions });
+      return { instructions: mockInstructions };
     case 'settings.get':
       return { settings };
     case 'settings.update': {
@@ -1445,6 +1472,32 @@ async function fakeTurn(threadId, text, images, turnId = 'turn_' + crypto.random
 
   const thinkId = 'r_' + crypto.randomBytes(4).toString('hex');
   persist(threadId, { type: 'reasoning', itemId: thinkId, text: 'Checking what the message asks for before answering.' }, turnId);
+
+  // "queued" in a message: an edit's card with the reply's other calls
+  // queued on it (docs/protocol.md, "Queued calls").
+  if (/queued/i.test(text)) {
+    const approvalId = 'ap_' + crypto.randomBytes(4).toString('hex');
+    const root = t.summary.cwd || '/Users/mike/dev/photo-sync';
+    const edit = (id, file, oldText, newText) => ({ itemId: id, name: 'Edit', title: `Edit ${file}`, input: { file_path: `${root}/${file}`, old_string: oldText, new_string: newText } });
+    const head = edit('q1', 'Tests/PreviewTests.swift', '        let started = Date()\n        _ = Preview.references(in: text)\n        XCTAssertLessThan(Date().timeIntervalSince(started), 10)', '        let seconds = cpuSeconds {\n            _ = Preview.references(in: text)\n        }\n        XCTAssertLessThan(seconds, 30)');
+    const calls = [
+      edit('q2', 'Tests/DraftTests.swift', '        let start = Date()', '        let seconds = cpuSeconds {\n            _ = Draft.parse(text)\n        }'),
+      { itemId: 'q3', name: 'Write', title: 'Write Tests/CPUTime.swift', input: { file_path: `${root}/Tests/CPUTime.swift`, content: 'import Darwin\n\n/// CPU time the block took, not wall time: a loaded machine\n/// doesn\'t fail the test.\nfunc cpuSeconds(_ body: () -> Void) -> Double {\n    let before = clock()\n    body()\n    return Double(clock() - before) / Double(CLOCKS_PER_SEC)\n}\n' } },
+      { itemId: 'q4', name: 'Bash', title: 'swift test --filter PreviewTests', input: { command: 'swift test --filter PreviewTests' } },
+    ];
+    for (const c of [head, ...calls]) persist(threadId, { type: 'tool.call', itemId: c.itemId, name: c.name, kind: c.name === 'Bash' ? 'command' : 'edit', title: c.title, input: c.input }, turnId);
+    persist(threadId, { type: 'approval.requested', approvalId, itemId: head.itemId, name: head.name, title: head.title, input: head.input, options: ['allow', 'allowAlways', 'deny'] }, turnId);
+    persist(threadId, { type: 'approval.queued', approvalId, calls }, turnId);
+    setStatus(threadId, 'waiting', true);
+    t.approvalWaiters ??= new Map();
+    const answer = await new Promise((resolve) => t.approvalWaiters.set(approvalId, resolve));
+    setStatus(threadId, 'running', false);
+    const answers = { [head.itemId]: answer.decision, ...(answer.queued ?? {}) };
+    for (const c of [head, ...calls]) persist(threadId, { type: 'tool.result', itemId: c.itemId, ok: answers[c.itemId] === 'allow', text: answers[c.itemId] === 'allow' ? 'Done.' : 'The user denied this.', truncated: false, images: [] }, turnId);
+    const allowed = Object.values(answers).filter((d) => d === 'allow').length;
+    persist(threadId, { type: 'assistant.text', itemId: 'm_' + crypto.randomBytes(4).toString('hex'), text: `Allowed ${allowed} of ${calls.length + 1}.` }, turnId);
+    return finishTurn(threadId, turnId, started, 'completed');
+  }
 
   if (/approval|ask me/i.test(text) || t.summary.permissionMode === 'ask') {
     const approvalId = 'ap_' + crypto.randomBytes(4).toString('hex');
@@ -1961,7 +2014,7 @@ function remoteThreads(client) {
     runners: [{
       id: BRUCE, name: bruce.name, icon: bruce.icon, online: true, lastSeenAt: iso(),
       rpcUrl: `ws://127.0.0.1:${port}/bruce/rpc`, tokenFile: path.join(dataDir, `secrets/runners/${BRUCE}.token`),
-    }],
+    }, ...MORE_RUNNERS],
     threads: rows,
     order: runnerOrder,
   };
@@ -2115,7 +2168,9 @@ function scheduleWake(threadId) {
       s.snoozedUntil = undefined;
       delete s.wakeWhen;
       s.needsYou = true;
-      // As the runner does: "Woke up" on the row until it's opened.
+      // As the runner does: a note in the thread, and "Woke up" on the row
+      // until it's opened.
+      persist(threadId, { type: 'system.note', text: 'Woke up from hibernating.' });
       s.woke = { at: iso(), ...(s.snoozedAt ? { since: s.snoozedAt } : {}) };
       delete s.snoozedAt;
       broadcastSummary(threadId);
